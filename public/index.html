@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="UTF-8">
+  <title>Status da Impressora</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    h1 { color: #333; }
+    .section { margin-bottom: 30px; }
+    .log, .pedido { background: #f9f9f9; border: 1px solid #ccc; padding: 10px; margin-bottom: 5px; }
+    .log { color: #555; }
+    .pedido { color: #222; }
+  </style>
+</head>
+<body>
+  <h1>Status da Impressora</h1>
+  <div class="section">
+    <h2>Logs</h2>
+    <div id="logs"></div>
+  </div>
+  <div class="section">
+    <h2>Pedidos Recebidos</h2>
+    <div id="pedidos"></div>
+  </div>
+  <script>
+    function atualizar() {
+      fetch('/logs').then(r => r.json()).then(logs => {
+        document.getElementById('logs').innerHTML = logs.map(l => `<div class='log'>${l}</div>`).join('');
+      });
+      fetch('/pedidos').then(r => r.json()).then(pedidos => {
+        document.getElementById('pedidos').innerHTML = pedidos.map(p => `<div class='pedido'>Pedido #${p.id} - Total: R$ ${p.total.toFixed(2)}</div>`).join('');
+      });
+    }
+    setInterval(atualizar, 2000);
+    atualizar();
+  </script>
+</body>
+</html>
