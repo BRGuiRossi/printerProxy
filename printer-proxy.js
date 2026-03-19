@@ -1,112 +1,84 @@
-const express = require('express');
-const cors = require('cors');
-const escpos = require('escpos');
-escpos.USB = require('escpos-usb');
-const os = require('os');
-const { exec } = require('child_process');
-const readline = require('readline');
+// Strict Integration: printer-proxy.js
+import express from 'express';
+import bodyParser from 'body-parser';
+import cors from 'cors';
+import escpos from 'escpos';
+import usb from 'escpos-usb';
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(bodyParser.json());
 
-const logs = [];
-const pedidos = [];
+// CONFIGURAÇÃO DA IMPRESSORA EPSON TM-T20X
+const VENDOR_ID = 0x04b8; // Epson
+const PRODUCT_ID = 0x0e15; // TM-T20X
 
-// Epson TM-T20X II Default IDs
-const VENDOR_ID = 0x04b8;
-const PRODUCT_ID = 0x0e27;
-const PORT = 3001;
-
-const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout
-});
-
-const WARNING_MSG = "  *** ATENÇÃO: NÃO FECHE ESTA JANELA! ***";
-
-function safeLog(msg) {
-    console.log(`\n${msg}\n${WARNING_MSG}`);
-}
-
-function addLog(msg, isError = false) {
-    const time = new Date().toLocaleTimeString();
-    const logMsg = `[${time}] ${msg}`;
-    safeLog(logMsg);
-    logs.push(logMsg);
-    if (logs.length > 100) logs.shift(); // Keep memory clean
-}
-
+// Fila de impressão
+let printQueue = [];
 let isPrinting = false;
-const printQueue = [];
 
-app.get('/', (req, res) => {
-    safeLog("[BROWSER STATUS] O Painel de Controle (Navegador) conectou ao proxy com sucesso!");
-    res.send("Proxy da Impressora Lar Pizza está Online!");
-});
+// Função auxiliar para remover acentos e caracteres especiais para impressora thermal
+function limpaTexto(text) {
+    if (!text) return '';
+    return String(text)
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, "") // Remove acentos
+        .replace(/[^a-zA-Z0-9\s#,.():/-]/g, ""); // Mantém apenas alfanuméricos e pontuação básica
+}
 
-// ROUTE: Add to Queue
-app.post('/print', (req, res) => {
-    const order = req.body;
-    printQueue.push({ order, res });
-    processQueue(); // Trigger queue
-});
+// === FIX 1: Função Auxiliar de Formatação de Colunas (Matrix de Itens) ===
+// Assume papel de 40 caracteres de largura (Standard para TM-T20X)
+function formatarLinhaItem(qtd, nome, valor) {
+    const limQtd = 4; // Largura da coluna Qtd
+    const limValor = 10; // Largura da coluna Valor ("R$ XXX,XX")
+    const limNome = 40 - limQtd - limValor - 6; // Sobra 20 para o nome (40 total - larguras - 2 separadores ' | ')
 
-// ASYNC QUEUE PROCESSOR
+    const strQtd = limpaTexto(qtd.toString()).padEnd(limQtd, ' ');
+    const strNome = limpaTexto(nome).substring(0, limNome).padEnd(limNome, ' ');
+    const strValor = `R$ ${parseFloat(valor).toFixed(2)}`.padEnd(limValor, ' ');
+
+    return `${strQtd} | ${strNome} | ${strValor}`;
+}
+
 async function processQueue() {
     if (isPrinting || printQueue.length === 0) return;
-    
     isPrinting = true;
-    const job = printQueue.shift();
-    const order = job.order;
-    const safeOrderId = String(order.id || 'TESTE').slice(-5).toUpperCase();
-
-    // Windows Sound Alert
-    try {
-        exec('powershell -c "(New-Object Media.SoundPlayer \'C:\\Windows\\Media\\Notify.wav\').PlaySync()"', () => {});
-    } catch (e) {}
-
-    addLog(`[FILA] Iniciando impressao: #${safeOrderId} (Restam: ${printQueue.length})`);
-    pedidos.push(order);
-    if (pedidos.length > 50) pedidos.shift();
+    const task = printQueue.shift();
 
     try {
-        await executePrint(order, safeOrderId);
-        addLog(`[SUCESSO] Pedido #${safeOrderId} impresso.`);
-        job.res.status(200).json({ success: true, message: "Impresso com sucesso" });
+        await executePrint(task.order, task.safeOrderId);
+        console.log(`[PRINT SUCCESS] Pedido impresso: ${task.safeOrderId}`);
     } catch (error) {
-        addLog(`[ERRO] Falha no pedido #${safeOrderId}: ${error.message}`, true);
-        job.res.status(500).json({ error: error.message });
+        console.error(`[PRINT ERROR] Falha ao imprimir ${task.safeOrderId}:`, error.message);
     } finally {
         isPrinting = false;
-        // Wait 1.5 seconds before processing the next ticket to allow USB buffer to clear
-        setTimeout(processQueue, 1500);
+        processQueue(); // Próximo item
     }
 }
 
-// PRINTER EXECUTION WRAPPER
-function executePrint(order, safeOrderId) {
+async function executePrint(order, safeOrderId) {
     return new Promise((resolve, reject) => {
-        try {
-            const device = new escpos.USB(VENDOR_ID, PRODUCT_ID);
-            // Forçamos ASCII para evitar que a biblioteca envie comandos de CodePage conflitantes
-            const printer = new escpos.Printer(device, { encoding: "ascii" });
+        let device;
+        let printer;
 
-            device.open((err) => {
-                if (err) {
-                    return reject(new Error(`Acesso negado a porta USB: ${err.message}`));
+        // Instancia a conexão USB por requisição para evitar Crash Global de hardware offline
+        try {
+            device = new escpos.USB(VENDOR_ID, PRODUCT_ID);
+            printer = new escpos.Printer(device);
+        } catch (usbInitError) {
+            return reject(new Error(`Falha ao conectar cabo USB da impressora: ${usbInitError.message}`));
+        }
+
+        try {
+            device.open((error) => {
+                if (error) {
+                    return reject(error);
                 }
 
                 try {
-                    // A SOLUÇÃO DEFINITIVA: Remove acentos e caracteres não-ASCII
-                    const limpaTexto = (str) => {
-                        if (!str) return '';
-                        return String(str)
-                            .normalize('NFD')
-                            .replace(/[\u0300-\u036f]/g, '') // Remove acentos (ex: á -> a, ç -> c)
-                            .replace(/[^\x20-\x7E]/g, '');   // Remove caracteres especiais/invisíveis
-                    };
+                    printer.encode('cp858'); // Normalização para português/acentos
 
+                    // === HEADER (Logo e dynamic Source) ===
                     printer
                         .font('a')
                         .align('ct')
@@ -115,136 +87,214 @@ function executePrint(order, safeOrderId) {
                         .text('LAR PIZZA')
                         .size(1, 1)
                         .style('normal')
-                        .text('------------------------------------------------')
-                        .align('lt')
-                        .text(`PEDIDO : #${safeOrderId}`)
-                        .text(`CLIENTE: ${limpaTexto(order.customerName) || 'Balcao / WhatsApp'}`)
-                        .text('------------------------------------------------');
+                        .text('R. Cardoso 152 - Sta. Efigenia - BH')
+                        .text('(31)99515-2921')
+                        .text('========================================') // Separador Duplo
+                        .feed(1);
 
-                    const items = Array.isArray(order.items) ? order.items : [];
-                    items.forEach(item => {
-                        const qty = String(item.quantity || 1).padStart(2, '0');
-                        const name = limpaTexto(item.name || 'Produto').substring(0, 28).padEnd(28, ' ');
-                        const price = Number(item.price || 0).toFixed(2).padStart(7, ' ');
-                        
-                        printer
-                            .align('lt')
-                            .text(`${qty}x ${name} R$ ${price}`);
-                    });
+                    // FIX 2: Dynamic Source Injection (e.g., PEDIDO IFOOD #12345)
+                    let headerText = 'PEDIDO';
+                    if (order.source && order.source.toLowerCase().includes('ifood')) headerText += ' IFOOD';
+                    else if (order.source && order.source.toLowerCase().includes('site')) headerText += ' SITE';
+                    else if (order.source && order.source.toLowerCase().includes('whatsapp')) headerText += ' WHATSAPP';
+                    else if (order.id && order.id.startsWith('ifood-')) headerText += ' IFOOD'; // Fallback logic based on uploaded server.js example
+                    else if (order.customerPhone && !order.customerId) headerText += ' WHATSAPP';
+                    else headerText += ' LOCAL';
+                    
+                    headerText += ` #${safeOrderId}`;
 
                     printer
-                        .text('------------------------------------------------')
-                        .align('rt')
-                        .size(1, 2)
                         .style('b')
-                        .text(`TOTAL: R$ ${Number(order.total || 0).toFixed(2)}`)
-                        .style('normal')
+                        .size(1, 2) // Double Height only for clarity
+                        .text(limpaTexto(headerText))
                         .size(1, 1)
-                        .feed(3)
-                        .cut()
-                        .close(() => resolve());
-                        
-                } catch (printErr) {
-                    reject(new Error(`Erro ao formatar o cupom: ${printErr.message}`));
+                        .style('normal')
+                        .feed(1);
+
+                    // Date and CID logic
+                    const agora = new Date();
+                    const dataFmt = agora.toLocaleDateString('pt-BR');
+                    const horaFmt = agora.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+                    const cidStr = order.customerId ? `(Cid: ${order.customerId.substring(0, 5)})` : '(Cid: Conv.)';
+                    
+                    printer
+                        .text(`${dataFmt} ${horaFmt} ${cidStr}`)
+                        .text('----------------------------------------') // Separador Simples
+                        .feed(1);
+
+                    // === SECTION: CLIENTE ===
+                    printer
+                        .align('lt')
+                        .style('b')
+                        .text('* CLIENTE *')
+                        .style('normal')
+                        .feed(1)
+                        .text(limpaTexto(order.customerName || 'Cliente Consumidor'))
+                        .text(limpaTexto(order.deliveryAddress || 'Retirada no Local'));
+
+                    if (order.addressContext || order.deliveryContext) {
+                        printer.text(`(${limpaTexto(order.addressContext || order.deliveryContext)})`);
+                    }
+                    if (order.customerPhone) {
+                        printer.text(limpaTexto(order.customerPhone));
+                    }
+                    
+                    printer
+                        .feed(1)
+                        .text('----------------------------------------')
+                        .feed(1);
+
+                    // === SECTION: ITENS DO PEDIDO (Matrix com Alinhamento Fixado) ===
+                    printer
+                        .style('b')
+                        .text('* ITENS DO PEDIDO *')
+                        .style('normal')
+                        .feed(1);
+
+                    // Cabeçalhos da Matrix
+                    printer.text('Qtd  | Item                  | Valor     ');
+                    printer.text('----------------------------------------');
+
+                    // Loop através dos itens usando formatarLinhaItem (FIX 3)
+                    if (Array.isArray(order.items) && order.items.length > 0) {
+                        order.items.forEach((item) => {
+                            const qtd = item.quantity || 1;
+                            const nome = item.name || item.title || 'Produto Lar Pizza';
+                            const valor = item.price || item.unit_price || 0;
+                            
+                            printer.text(formatarLinhaItem(qtd, nome, valor));
+                        });
+                    } else {
+                        printer.text('Nenhum item informado.');
+                    }
+                    
+                    printer
+                        .feed(1)
+                        .text('----------------------------------------');
+
+                    // === SECTION: RESUMO E TOTAL ===
+                    // Subtotal
+                    if (order.subtotal) {
+                        printer
+                            .align('rt')
+                            .text(`Subtotal: R$ ${parseFloat(order.subtotal).toFixed(2)}`);
+                    }
+                    // Taxa de Entrega (Do iFood/Google Maps)
+                    if (order.deliveryFee) {
+                        printer
+                            .align('rt')
+                            .text(`Taxa de Entrega: R$ ${parseFloat(order.deliveryFee).toFixed(2)}`);
+                    }
+                    
+                    printer.feed(1);
+
+                    // TOTAL DO PEDIDO (Grande e Centralizado)
+                    const totalText = `R$ ${parseFloat(order.totalPrice || 0).toFixed(2)}`;
+                    printer
+                        .align('ct')
+                        .style('b')
+                        .size(2, 2)
+                        .text('TOTAL DO PEDIDO')
+                        .text(totalText)
+                        .size(1, 1)
+                        .style('normal')
+                        .feed(1)
+                        .text('----------------------------------------')
+                        .feed(1);
+
+                    // === FIX 4: SECTION SEPARADA - ENTREGA E PAGAMENTO ===
+                    printer
+                        .align('lt')
+                        .style('b')
+                        .text('* ENTREGA E PAGAMENTO *')
+                        .style('normal')
+                        .feed(1);
+
+                    // Detalhes do Pagamento (Lógica condicional)
+                    let pmtMethod = 'Forma de Pagamento Nao Informada';
+                    if (order.paymentMethod === 'credit_card') pmtMethod = 'PAGAMENTO: Cartao de Credito';
+                    else if (order.paymentMethod === 'debit_card') pmtMethod = 'PAGAMENTO: Cartao de Debito';
+                    else if (order.paymentMethod === 'pix' || order.source === 'ifood') pmtMethod = `PAGAMENTO: PIX/iFood (Pre-pago)`;
+                    else if (order.paymentMethod === 'cash') pmtMethod = `PAGAMENTO: Dinheiro na Entrega`;
+                    
+                    printer.text(limpaTexto(pmtMethod));
+
+                    // Detalhes da Entrega/Retirada
+                    let deliveryStr = 'ENTREGA: Moto Entregador';
+                    if (!order.deliveryAddress || order.deliveryMethod === 'pickup') {
+                        deliveryStr = 'CONTEXTO: Retirada no Local';
+                    }
+                    printer.text(limpaTexto(deliveryStr));
+
+                    printer
+                        .feed(1)
+                        .text('----------------------------------------')
+                        .feed(1);
+
+                    // === FOOTER (Observações e Agradecimento) ===
+                    if (order.observations || order.customerNotes) {
+                        printer
+                            .align('lt')
+                            .style('b')
+                            .text('* Observacao:*')
+                            .style('normal')
+                            .text(limpaTexto(order.observations || order.customerNotes))
+                            .feed(1);
+                    }
+
+                    printer
+                        .align('ct')
+                        .text('Muito obrigado por escolher a Lar Pizza!')
+                        .feed(1);
+
+                    if (order.source === 'ifood') {
+                        printer.text('Pedido iFood confirmado.');
+                    } else if (order.source === 'lar-pizza.web.app' || order.larPizzaAppOrderId) {
+                        printer.text('Pedido feito pelo site lar-pizza.web.app');
+                    }
+
+                    // Correção de Asincronicidade e Fechamento Seguro
+                    printer.feed(2).cut();
+                    
+                    printer.close(() => {
+                        resolve();
+                    });
+
+                } catch (err) {
+                    if (device) {
+                        device.close(() => {});
+                    }
+                    reject(err);
                 }
             });
-        } catch (usbInitError) {
-            reject(new Error(`Driver nao encontrado: ${usbInitError.message}`));
+        } catch (openError) {
+            reject(openError);
         }
     });
 }
 
-app.get('/logs', (req, res) => res.json(logs));
-app.get('/pedidos', (req, res) => res.json(pedidos));
-
-// --- STARTUP & CONNECTION CHECK SEQUENCE ---
-
-function getLocalIp() {
-    const interfaces = os.networkInterfaces();
-    let localIp = 'localhost';
-    for (const name of Object.keys(interfaces)) {
-        for (const iface of interfaces[name]) {
-            if (iface.family === 'IPv4' && !iface.internal) {
-                localIp = iface.address;
-                break;
-            }
-        }
-    }
-    return localIp;
-}
-
-function testPrinterConnection(callback) {
-    try {
-        const device = new escpos.USB(VENDOR_ID, PRODUCT_ID);
-        device.open((err) => {
-            if (err) {
-                return callback(false, err.message);
-            }
-            device.close(); // Fecha a porta para liberar para o Express
-            return callback(true);
-        });
-    } catch (err) {
-        return callback(false, err.message);
-    }
-}
-
-function promptRetry() {
-    rl.question('\n======================================================\n[ERRO] IMPRESSORA DESLIGADA OU DESCONECTADA!\n\n1. Verifique se a Epson TM-T20X esta ligada.\n2. Verifique se o cabo USB esta conectado.\n3. Pressione [ENTER] para testar novamente...\n======================================================\n', () => {
-        startupSequence();
-    });
-}
-
-let serverStarted = false;
-
-function printReadyScreen() {
-    const localIp = getLocalIp();
-    console.clear();
-    safeLog(`
-    ███████╗██╗   ██╗ █████╗ ████████╗███████╗    ██████╗ ███████╗██╗   ██╗
-    ██╔════╝██║   ██║██╔══██╗╚══██╔══╝██╔════╝    ██╔══██╗██╔════╝██║   ██║
-    ███████╗██║   ██║███████║   ██║   █████╗      ██████╔╝█████╗  ██║   ██║
-    ╚════██║██║   ██║██╔══██║   ██║   ██╔══╝      ██╔══██╗██╔══╝  ██║   ██║
-    ███████║╚██████╔╝██║  ██║   ██║   ███████╗    ██║  ██║███████╗╚██████╔╝
-    ╚══════╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝    ╚═╝  ╚═╝╚══════╝ ╚═════╝ 
-
-    [STATUS DO SISTEMA]
-    ✅ IMPRESSORA : CONECTADA E PRONTA
-    ⏳ NAVEGADOR  : AGUARDANDO CONEXAO (Abra o painel em http://${localIp}:${PORT})
-    `);
-}
-
-function startServer() {
-    app.listen(PORT, '0.0.0.0', () => {
-        serverStarted = true;
-        printReadyScreen();
-    }).on('error', (err) => {
-        if (err.code === 'EADDRINUSE') {
-            safeLog(`[ERRO CRITICO] A porta ${PORT} ja esta em uso. O proxy ja esta aberto em outra janela?`);
-        } else {
-            safeLog(`[ERRO SERVIDOR] ${err.message}`);
-        }
-        process.exit(1);
-    });
-}
-
-function startupSequence() {
-    console.clear();
-    console.log("Iniciando Proxy Lar Pizza...");
-    console.log("Verificando conexao USB com a impressora...\n");
+// === ROTAS DA API ===
+app.post('/print', (req, res) => {
+    const orderData = req.body;
     
-    testPrinterConnection((success, errorMsg) => {
-        if (!success) {
-            safeLog(`Falha na comunicacao com o hardware: ${errorMsg}`);
-            promptRetry();
-        } else {
-            safeLog("Impressora detectada com sucesso!");
-            if (!serverStarted) {
-                startServer();
-            } else {
-                printReadyScreen();
-            }
-        }
-    });
-}
+    if (!orderData || !orderData.id) {
+        return res.status(400).send('Dados insuficientes do pedido.');
+    }
 
-startupSequence();
+    const safeOrderId = String(orderData.id).substring(0, 10).toUpperCase();
+
+    // Adiciona à fila
+    printQueue.push({ order: orderData, safeOrderId });
+    processQueue(); // Tenta iniciar processamento
+
+    res.status(200).send({ 
+        success: true, 
+        message: `Pedido #${safeOrderId} adicionado a fila de impressao.`
+    });
+});
+
+const PORT = 3001;
+app.listen(PORT, () => {
+    console.log(`[PRINTER PROXY] 🖨️ Servidor rodando em http://localhost:${PORT}`);
+    console.log(`[PRINTER PROXY] Conecte a Epson TM-T20X via USB.`);
+});
