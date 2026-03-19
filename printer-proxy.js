@@ -25,7 +25,6 @@ const rl = readline.createInterface({
 
 const WARNING_MSG = "  *** ATENÇÃO: NÃO FECHE ESTA JANELA! ***";
 
-// Wrapper para garantir que TODOS os logs exibam o aviso de não fechar
 function safeLog(msg) {
     console.log(`\n${msg}\n${WARNING_MSG}`);
 }
@@ -35,96 +34,125 @@ function addLog(msg, isError = false) {
     const logMsg = `[${time}] ${msg}`;
     safeLog(logMsg);
     logs.push(logMsg);
-    if (logs.length > 100) logs.shift(); // Evita vazamento de memória
+    if (logs.length > 100) logs.shift(); // Keep memory clean
 }
 
-// --- EXPRESS ROUTES ---
+let isPrinting = false;
+const printQueue = [];
 
 app.get('/', (req, res) => {
     safeLog("[BROWSER STATUS] O Painel de Controle (Navegador) conectou ao proxy com sucesso!");
     res.send("Proxy da Impressora Lar Pizza está Online!");
 });
 
+// ROUTE: Add to Queue
 app.post('/print', (req, res) => {
     const order = req.body;
+    printQueue.push({ order, res });
+    processQueue(); // Trigger queue
+});
+
+// ASYNC QUEUE PROCESSOR
+async function processQueue() {
+    if (isPrinting || printQueue.length === 0) return;
     
-    // Alerta sonoro do Windows para a cozinha
+    isPrinting = true;
+    const job = printQueue.shift();
+    const order = job.order;
+    const safeOrderId = String(order.id || 'TESTE').slice(-5).toUpperCase();
+
+    // Windows Sound Alert
     try {
         exec('powershell -c "(New-Object Media.SoundPlayer \'C:\\Windows\\Media\\Notify.wav\').PlaySync()"', () => {});
-    } catch (e) {
-        // Ignora erros de audio para não travar
-    }
+    } catch (e) {}
 
-    const safeOrderId = String(order.id || 'TESTE').slice(-5).toUpperCase();
-    addLog(`[NOVO PEDIDO] Iniciando impressao: #${safeOrderId}`);
+    addLog(`[FILA] Iniciando impressao: #${safeOrderId} (Restam: ${printQueue.length})`);
     pedidos.push(order);
     if (pedidos.length > 50) pedidos.shift();
 
     try {
-        const device = new escpos.USB(VENDOR_ID, PRODUCT_ID);
-        const printer = new escpos.Printer(device);
-
-        device.open((err) => {
-            if (err) {
-                const errorMsg = "Acesso negado ou impressora desligada.";
-                addLog(`[ERRO USB] ${errorMsg} - ${err.message}`, true);
-                return res.status(500).json({ error: errorMsg, details: err.message });
-            }
-
-            try {
-                // Cabeçalho do Cupom
-                printer
-                    .font('a')
-                    .align('ct')
-                    .style('b')
-                    .size(2, 2)
-                    .text('LAR PIZZA')
-                    .size(1, 1)
-                    .style('normal')
-                    .text('------------------------------------------------')
-                    .align('lt')
-                    .text(`PEDIDO : #${safeOrderId}`)
-                    .text(`CLIENTE: ${order.customerName || 'Balcao / WhatsApp'}`)
-                    .text('------------------------------------------------');
-
-                // Itens Formatados
-                const items = Array.isArray(order.items) ? order.items : [];
-                items.forEach(item => {
-                    const qty = String(item.quantity || 1).padStart(2, '0');
-                    const name = String(item.name || 'Produto').substring(0, 28).padEnd(28, ' ');
-                    const price = Number(item.price || 0).toFixed(2).padStart(7, ' ');
-                    
-                    printer
-                        .align('lt')
-                        .text(`${qty}x ${name} R$ ${price}`);
-                });
-
-                // Rodapé e Corte
-                printer
-                    .text('------------------------------------------------')
-                    .align('rt')
-                    .size(1, 2)
-                    .style('b')
-                    .text(`TOTAL: R$ ${Number(order.total || 0).toFixed(2)}`)
-                    .style('normal')
-                    .size(1, 1)
-                    .feed(3)
-                    .cut()
-                    .close(() => {
-                        addLog(`[SUCESSO] Pedido #${safeOrderId} impresso na cozinha.`);
-                        res.status(200).json({ success: true, message: "Impresso com sucesso" });
-                    });
-                    
-            } catch (printErr) {
-                addLog(`[ERRO FORMATACAO] ${printErr.message}`, true);
-                res.status(500).json({ error: "Erro ao formatar o cupom." });
-            }
-        });
-    } catch (usbInitError) {
-        addLog(`[ERRO DRIVER] Impressora nao encontrada. ${usbInitError.message}`, true);
-        res.status(500).json({ error: "O driver da impressora falhou ao inicializar." });
+        await executePrint(order, safeOrderId);
+        addLog(`[SUCESSO] Pedido #${safeOrderId} impresso.`);
+        job.res.status(200).json({ success: true, message: "Impresso com sucesso" });
+    } catch (error) {
+        addLog(`[ERRO] Falha no pedido #${safeOrderId}: ${error.message}`, true);
+        job.res.status(500).json({ error: error.message });
+    } finally {
+        isPrinting = false;
+        // Wait 1.5 seconds before processing the next ticket to allow USB buffer to clear
+        setTimeout(processQueue, 1500);
     }
-});
+}
+
+// PRINTER EXECUTION WRAPPER
+function executePrint(order, safeOrderId) {
+    return new Promise((resolve, reject) => {
+        try {
+            const device = new escpos.USB(VENDOR_ID, PRODUCT_ID);
+            // Forçamos ASCII para evitar que a biblioteca envie comandos de CodePage conflitantes
+            const printer = new escpos.Printer(device, { encoding: "ascii" });
+
+            device.open((err) => {
+                if (err) {
+                    return reject(new Error(`Acesso negado a porta USB: ${err.message}`));
+                }
+
+                try {
+                    // A SOLUÇÃO DEFINITIVA: Remove acentos e caracteres não-ASCII
+                    const limpaTexto = (str) => {
+                        if (!str) return '';
+                        return String(str)
+                            .normalize('NFD')
+                            .replace(/[\u0300-\u036f]/g, '') // Remove acentos (ex: á -> a, ç -> c)
+                            .replace(/[^\x20-\x7E]/g, '');   // Remove caracteres especiais/invisíveis
+                    };
+
+                    printer
+                        .font('a')
+                        .align('ct')
+                        .style('b')
+                        .size(2, 2)
+                        .text('LAR PIZZA')
+                        .size(1, 1)
+                        .style('normal')
+                        .text('------------------------------------------------')
+                        .align('lt')
+                        .text(`PEDIDO : #${safeOrderId}`)
+                        .text(`CLIENTE: ${limpaTexto(order.customerName) || 'Balcao / WhatsApp'}`)
+                        .text('------------------------------------------------');
+
+                    const items = Array.isArray(order.items) ? order.items : [];
+                    items.forEach(item => {
+                        const qty = String(item.quantity || 1).padStart(2, '0');
+                        const name = limpaTexto(item.name || 'Produto').substring(0, 28).padEnd(28, ' ');
+                        const price = Number(item.price || 0).toFixed(2).padStart(7, ' ');
+                        
+                        printer
+                            .align('lt')
+                            .text(`${qty}x ${name} R$ ${price}`);
+                    });
+
+                    printer
+                        .text('------------------------------------------------')
+                        .align('rt')
+                        .size(1, 2)
+                        .style('b')
+                        .text(`TOTAL: R$ ${Number(order.total || 0).toFixed(2)}`)
+                        .style('normal')
+                        .size(1, 1)
+                        .feed(3)
+                        .cut()
+                        .close(() => resolve());
+                        
+                } catch (printErr) {
+                    reject(new Error(`Erro ao formatar o cupom: ${printErr.message}`));
+                }
+            });
+        } catch (usbInitError) {
+            reject(new Error(`Driver nao encontrado: ${usbInitError.message}`));
+        }
+    });
+}
 
 app.get('/logs', (req, res) => res.json(logs));
 app.get('/pedidos', (req, res) => res.json(pedidos));
@@ -219,5 +247,4 @@ function startupSequence() {
     });
 }
 
-// Inicia o processo
 startupSequence();
