@@ -85,13 +85,10 @@ async function processQueue() {
 }
 
 // PRINTER EXECUTION WRAPPER
-// << EXACT EXISTING CODE ABOVE >>
-// PRINTER EXECUTION WRAPPER
 function executePrint(order, safeOrderId) {
     return new Promise((resolve, reject) => {
         try {
             const device = new escpos.USB(VENDOR_ID, PRODUCT_ID);
-            // MUDANÇA 1: Configura o Node.js para converter tudo para Latin-1 (Multilingual)
             const printer = new escpos.Printer(device, { encoding: "cp858" });
 
             device.open((err) => {
@@ -100,48 +97,90 @@ function executePrint(order, safeOrderId) {
                 }
 
                 try {
-                    // Função de segurança: Se a impressora ignorar o encoding, removemos os acentos mais bizarros.
-                    const limpaTexto = (str) => str ? String(str).normalize('NFD').replace(/[\u0300-\u036f]/g, '') : '';
+                    // Absolute special character removal logic
+                    const limpaTexto = (str) => {
+                        if (str === null || str === undefined) return '';
+                        return String(str)
+                            .normalize('NFD')
+                            .replace(/[\u0300-\u036f]/g, '') // Remove acentos
+                            .replace(/[^\x20-\x7E\r\n]/g, ''); // Garante apenas ASCII puro
+                    };
 
-                    printer
-                        .encode('cp858') // MUDANÇA 2: Envia comando ESC/POS forçando a impressora a ler acentos
-                        .font('a')
-                        .align('ct')
-                        .style('b')
-                        .size(2, 2)
-                       .text('LAR PIZZA')
-                        .size(1, 1)
-                        .style('normal')
-                        .text('R. Cardoso 152 - Sta. Efigenia - BH')
-                        .text('(31)99515-2921')
-                        .text('========================================') // Separador Duplo
-                        .feed(1);
+                    const timestamp = new Date().toLocaleString('pt-BR');
+                    
+                    printer.encode('cp858').font('a');
 
+                    // 1. TIMESTAMP
+                    printer.align('ct').style('normal').size(1, 1);
+                    printer.text(timestamp);
+                    printer.text('---------------------------------------');
+
+                    // 2. HEADER
+                    printer.style('b').size(2, 2).text('LAR PIZZA');
+                    printer.size(1, 1).style('normal');
+                    printer.text('R. Cardoso 152 - Sta. Efigenia - BH');
+                    printer.text('(31)99515-2921');
+                    printer.text('---------------------------------------');
+
+                    // 3. ORDER NUMBER
+                    printer.style('b').size(1, 1).text(`PEDIDO APP: #${safeOrderId}`);
+                    printer.style('normal').text('---------------------------------------');
+
+                    // 4. ITEMS & TOTAL
+                    printer.align('lt');
                     const items = Array.isArray(order.items) ? order.items : [];
                     items.forEach(item => {
                         const qty = String(item.quantity || 1).padStart(2, '0');
-                        // Aplica a limpeza de acentos e trunca para 28 caracteres
-                        const name = limpaTexto(item.name || 'Produto').substring(0, 28).padEnd(28, ' ');
+                        const rawName = limpaTexto(item.name || 'Produto');
+                        const name = rawName.substring(0, 32).padEnd(32, ' ');
                         const price = Number(item.price || 0).toFixed(2).padStart(7, ' ');
                         
-                        printer
-                            .align('lt')
-                            .text(`${qty}x ${name} R$ ${price}`);
+                        printer.text(`${qty}x ${name} R$ ${price}`);
                     });
+                    printer.align('rt').style('b').text(`TOTAL: R$ ${Number(order.totalPrice || order.total || 0).toFixed(2)}`);
+                    printer.style('normal').align('ct').text('---------------------------------------');
 
-                    printer
-                        .text('------------------------------------------------')
-                        .align('rt')
-                        .size(1, 2)
-                        .style('b')
-                        .text(`TOTAL: R$ ${Number(order.total || 0).toFixed(2)}`)
-                        .style('normal')
-                        .size(1, 1)
-                        .feed(3)
-                        .cut()
-                        .close(() => {
-                            resolve();
-                        });
+                    // 5. EXTRAS / REMOVALS
+                    const extras = limpaTexto(order.extras || order.removals || '');
+                    if (extras) {
+                        printer.align('lt').text('EXTRA / REMOVALS:');
+                        printer.text(extras);
+                        printer.align('ct').text('------------------------------------------------');
+                    }
+
+                    // 6. OBSERVATIONS
+                    const obs = limpaTexto(order.observations || order.observacoes || '');
+                    if (obs) {
+                        printer.align('lt').text('OBSERVACOES:');
+                        printer.text(obs);
+                        printer.align('ct').text('------------------------------------------------');
+                    }
+
+                    // 7. PAYMENT & DELIVERY
+                    const paymentMethod = limpaTexto(order.paymentMethod || order.payment_method || 'NAO INFORMADO').toUpperCase();
+                    const deliveryType = limpaTexto(order.deliveryType || order.delivery_type || 'ENTREGA').toUpperCase();
+                    
+                    printer.align('ct').style('b');
+                    printer.text(`FORMA DE PAGAMENTO: ${paymentMethod}`);
+                    printer.text(`FORMA DE ENTREGA: ${deliveryType}`);
+                    printer.style('normal').text('------------------------------------------------');
+
+                    // 8. CUSTOMER INFO & ADDRESS
+                    const customerName = limpaTexto(order.customerName || order.customer_name || 'CLIENTE NAO INFORMADO');
+                    const customerPhone = limpaTexto(order.customerPhone || order.customer_phone || '');
+                    const address = limpaTexto(order.deliveryAddress || order.delivery_address || 'RETIRADA NO LOCAL');
+
+                    printer.align('ct');
+                    printer.text(`Cliente: ${customerName}`);
+                    if (customerPhone) printer.text(`Tel: ${customerPhone}`);
+                    printer.feed(1); // Leave GAP
+                    
+                    printer.style('b').text(address).style('normal');
+
+                    // CUT & CLOSE
+                    printer.feed(3).cut().close(() => {
+                        resolve();
+                    });
                         
                 } catch (printErr) {
                     reject(new Error(`Erro ao formatar o cupom: ${printErr.message}`));
@@ -152,50 +191,6 @@ function executePrint(order, safeOrderId) {
         }
     });
 }
-
-app.get('/logs', (req, res) => res.json(logs));
-// << EXACT EXISTING CODE BELOW (Minimum 2 lines) >>
-
-// PRINTER EXECUTION WRAPPER FOR TEEEEEEEEEEEEEEEEEEESSSSSSSSSSSSSTT  REAL ON ABOVE
-function executePrint(order, safeOrderId) {
-    return new Promise((resolve, reject) => {
-        try {
-            const device = new escpos.USB(VENDOR_ID, PRODUCT_ID);
-            const printer = new escpos.Printer(device);
-
-            device.open((err) => {
-                if (err) {
-                    return reject(new Error(`Acesso negado a porta USB: ${err.message}`));
-                }
-
-                try {
-                    // Extrai a fonte (ex: "[iFood]") do nome do cliente, ou usa "[APP]" como fallback
-                    const sourceLabel = order.customerName ? order.customerName.split(' ')[0] : '[APP]';
-                    const timestamp = new Date().toLocaleString('pt-BR');
-
-                    printer
-                        .align('lt')
-                        .size(1, 1)
-                        .text(`TIME  : ${timestamp}`)
-                        .text(`SOURCE: ${sourceLabel}`)
-                        .feed(3)
-                        .cut()
-                        .close(() => {
-                            resolve();
-                        });
-                        
-                } catch (printErr) {
-                    reject(new Error(`Erro ao formatar o cupom de teste: ${printErr.message}`));
-                }
-            });
-        } catch (usbInitError) {
-            reject(new Error(`Driver nao encontrado: ${usbInitError.message}`));
-        }
-    });
-}
-
-
-
 
 app.get('/logs', (req, res) => res.json(logs));
 app.get('/pedidos', (req, res) => res.json(pedidos));
