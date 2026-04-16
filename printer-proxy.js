@@ -5,6 +5,19 @@ escpos.Network = require('escpos-network');
 const os = require('os');
 const { exec } = require('child_process');
 const readline = require('readline');
+const fs = require('fs');
+const path = require('path');
+
+// EVITA QUE A JANELA FECHE SOZINHA EM CASO DE ERRO FATAL
+process.on('uncaughtException', (err) => {
+    console.error('\n======================================================');
+    console.error('[ERRO FATAL] O aplicativo encontrou um problema crítico:');
+    console.error(err.message || err);
+    console.error('======================================================\n');
+    console.log('Pressione ENTER para fechar a janela...');
+    const rlFallback = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rlFallback.question('', () => process.exit(1));
+});
 
 const app = express();
 app.use(cors());
@@ -16,9 +29,28 @@ const pedidos = [];
 // ==========================================
 // CONFIGURAÇÃO DA IMPRESSORA DE REDE
 // ==========================================
-const PRINTER_IP = '192.168.1.200'; // 🔴 COLOQUE O IP DA SUA EPSON AQUI
+let PRINTER_IP = ''; // Será preenchido dinamicamente
 const PRINTER_PORT = 9100;
 const PORT = 3001;
+
+// Ajuste para funcionar dentro do .exe compilado pelo pkg (salva na mesma pasta do .exe)
+const isCompiled = typeof process.pkg !== 'undefined';
+const basePath = isCompiled ? path.dirname(process.execPath) : __dirname;
+const CONFIG_FILE = path.join(basePath, 'printer-config.json');
+
+function loadConfig() {
+    try {
+        if (fs.existsSync(CONFIG_FILE)) {
+            const data = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+            return data.printerIp || '';
+        }
+    } catch (e) {}
+    return '';
+}
+
+function saveConfig(ip) {
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ printerIp: ip }));
+}
 
 // ==========================================
 // DADOS DO ESTABELECIMENTO
@@ -335,9 +367,33 @@ function testPrinterConnection(callback) {
     }
 }
 
+function promptForIp() {
+    rl.question('\n👉 Digite o IP da sua impressora Epson (ex: 192.168.1.200): ', (ip) => {
+        if (!ip || ip.trim() === '') return promptForIp();
+        PRINTER_IP = ip.trim();
+        console.log(`\nTestando conexao com ${PRINTER_IP}...`);
+        
+        testPrinterConnection((success, errorMsg) => {
+            if (success) {
+                saveConfig(PRINTER_IP);
+                safeLog("✅ Impressora conectada e IP salvo com sucesso!");
+                if (!serverStarted) startServer();
+                else printReadyScreen();
+            } else {
+                safeLog(`❌ Falha ao conectar no IP ${PRINTER_IP}: ${errorMsg}`);
+                promptForIp();
+            }
+        });
+    });
+}
+
 function promptRetry() {
-    rl.question(`\n======================================================\n[ERRO] IMPRESSORA DE REDE INACESSÍVEL!\n\n1. Verifique se a Epson TM-T20X esta ligada.\n2. Verifique se o cabo de rede esta conectado.\n3. Confirme se o IP no script (${PRINTER_IP}) esta correto.\n4. Pressione [ENTER] para testar novamente...\n======================================================\n`, () => {
-        startupSequence();
+    rl.question(`\n======================================================\n[ERRO] IMPRESSORA DE REDE INACESSÍVEL!\n\n1. Tentar conectar novamente no IP salvo (${PRINTER_IP}) [Pressione ENTER]\n2. Digitar um NOVO IP (Digite 'N' e pressione ENTER)\n======================================================\n> `, (answer) => {
+        if (answer.trim().toUpperCase() === 'N') {
+            promptForIp();
+        } else {
+            startupSequence();
+        }
     });
 }
 
@@ -376,22 +432,29 @@ function startServer() {
 
 function startupSequence() {
     console.clear();
-    console.log("Iniciando Proxy Lar Pizza...");
-    console.log("Verificando conexao USB com a impressora...\n");
+    console.log("Iniciando Proxy Lar Pizza...\n");
     
-    testPrinterConnection((success, errorMsg) => {
-        if (!success) {
-            safeLog(`Falha na comunicacao com o hardware: ${errorMsg}`);
-            promptRetry();
-        } else {
-            safeLog("Impressora detectada com sucesso!");
-            if (!serverStarted) {
-                startServer();
+    PRINTER_IP = loadConfig();
+    
+    if (!PRINTER_IP) {
+        console.log("Nenhum IP de impressora configurado anteriormente.");
+        promptForIp();
+    } else {
+        console.log(`Verificando conexao com o IP salvo: ${PRINTER_IP}...\n`);
+        testPrinterConnection((success, errorMsg) => {
+            if (!success) {
+                safeLog(`Falha na comunicacao com o hardware: ${errorMsg}`);
+                promptRetry();
             } else {
-                printReadyScreen();
+                safeLog("Impressora detectada com sucesso!");
+                if (!serverStarted) {
+                    startServer();
+                } else {
+                    printReadyScreen();
+                }
             }
-        }
-    });
+        });
+    }
 }
 
 startupSequence();
