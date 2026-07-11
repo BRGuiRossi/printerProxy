@@ -7,6 +7,8 @@ const { exec } = require('child_process');
 const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
+const http = require('http');
 
 // EVITA QUE A JANELA FECHE SOZINHA EM CASO DE ERRO FATAL
 process.on('uncaughtException', (err) => {
@@ -32,6 +34,10 @@ const pedidos = [];
 let PRINTER_IP = ''; // Será preenchido dinamicamente
 const PRINTER_PORT = 9100;
 const PORT = 3001;
+let SERVER_URL = '';      // URL do servidor cloud (ex: https://larpizza.app.br)
+let SERVER_SECRET = '';   // Deve coincidir com PRINTER_PROXY_SECRET no servidor
+const PRINTED_IDS = new Set(); // Dedup em memória — evita reimprimir na mesma sessão
+let pollingInterval = null;
 
 // Ajuste para funcionar dentro do .exe compilado pelo pkg (salva na mesma pasta do .exe)
 const isCompiled = typeof process.pkg !== 'undefined';
@@ -42,14 +48,19 @@ function loadConfig() {
     try {
         if (fs.existsSync(CONFIG_FILE)) {
             const data = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-            return data.printerIp || '';
+            return {
+                printerIp: data.printerIp || '',
+                serverUrl: data.serverUrl || '',
+                serverSecret: data.serverSecret || ''
+            };
         }
     } catch (e) {}
-    return '';
+    return { printerIp: '', serverUrl: '', serverSecret: '' };
 }
 
-function saveConfig(ip) {
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ printerIp: ip }));
+function saveConfig(updates) {
+    const existing = loadConfig();
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ ...existing, ...updates }));
 }
 
 // ==========================================
@@ -124,10 +135,17 @@ async function processQueue() {
     try {
         await executePrint(order, safeOrderId);
         addLog(`[SUCESSO] Pedido #${safeOrderId} impresso.`);
-        job.res.status(200).json({ success: true, message: "Impresso com sucesso" });
+        if (job.res) job.res.status(200).json({ success: true, message: "Impresso com sucesso" });
+        // If job came from server polling, mark it as printed on the cloud
+        if (job.fromPoll && SERVER_URL && SERVER_SECRET) {
+            httpPost(`${SERVER_URL}/api/orders/mark-printed`, { orderId: order.id }, { 'x-printer-secret': SERVER_SECRET })
+                .catch(e => addLog(`[POLL] Erro ao marcar impresso: ${e.message}`, true));
+        }
     } catch (error) {
         addLog(`[ERRO] Falha no pedido #${safeOrderId}: ${error.message}`, true);
-        job.res.status(500).json({ error: error.message });
+        if (job.res) job.res.status(500).json({ error: error.message });
+        // On failure, remove from PRINTED_IDS so it can be retried on next poll
+        if (job.fromPoll) PRINTED_IDS.delete(order.id);
     } finally {
         isPrinting = false;
         // Wait 1.5 seconds before processing the next ticket to allow USB buffer to clear
@@ -202,6 +220,13 @@ function executePrint(order, safeOrderId) {
 
                     const isPickup = order.shippingMethod === 'pickup' || order.deliveryType === 'pickup';
                     const orderDate = formatDateTime(order.createdAt);
+
+                    const SOURCE_LABELS = {
+                        ifood: 'iFood', app: 'Site / App', zap: 'WhatsApp',
+                        whatsapp: 'WhatsApp', whatsapp_flow: 'WhatsApp',
+                        counter: 'Balcao', takeat_import: 'Takeat', '99food': '99Food'
+                    };
+                    const sourceLabel = SOURCE_LABELS[order.source] || limpaTexto(order.source || 'Site / App');
                     
                     printer.encode('cp858').font('a');
 
@@ -214,7 +239,7 @@ function executePrint(order, safeOrderId) {
                     printer.text(STORE_ADDRESS);
                     printer.text(`Tel: ${STORE_PHONE}`);
                     printer.text('------------------------------------------------');
-                    printer.text(`iFood #${safeOrderId}`);
+                    printer.text(`${sourceLabel} #${safeOrderId}`);
                     printer.size(1, 1).style('normal');
                     printer.text(isPickup ? '>>> PARA RETIRADA <<<' : '>>> PARA ENTREGA <<<');
 
@@ -235,7 +260,7 @@ function executePrint(order, safeOrderId) {
                     printer.align('lt').style('b');
                     printer.text(`Cliente: ${limpaTexto(order.customerName || 'Nao Informado')}`);
                     printer.style('normal');
-                    if (order.customerPhone) printer.text(`Telefone: ${limpaTexto(order.customerPhone)}`);
+                    if (order.customerPhone) printer.text(`CEL: ${limpaTexto(order.customerPhone)}`);
                     if (order.customerDocument) printer.text(`CPF/CNPJ: ${limpaTexto(order.customerDocument)}`);
                     if (order.pickupCode) {
                         printer.feed(1).style('b').size(2, 2).align('ct');
@@ -263,16 +288,28 @@ function executePrint(order, safeOrderId) {
                     // ==========================================
                     printer.style('b').text('Qtd   Item                              Preco').style('normal');
                     printer.text('------------------------------------------------');
-                    
+
                     const items = Array.isArray(order.items) ? order.items : [];
+                    // Pizzas meio a meio chegam como "<meio> SaborA / <meio> SaborB" no nome
+                    // (CustomerAppV2, AttendantApp, Operate). Usamos ½ (o simbolo 1/2) em vez
+                    // do caractere literal para nao depender da codificacao do arquivo.
+                    const HALF_HALF_REGEX = /^½\s*(.+?)\s*\/\s*½\s*(.+)$/;
+
                     items.forEach(item => {
                         const qty = String(item.quantity || 1).padStart(2, '0');
-                        const rawName = limpaTexto(item.name || 'Produto');
-                        const name = rawName.substring(0, 32).padEnd(32, ' ');
                         const price = Number(item.price || 0).toFixed(2).padStart(7, ' ');
-                        
-                        printer.style('b').text(`${qty}x ${name} R$ ${price}`).style('normal');
-                        
+                        const halfMatch = String(item.name || '').match(HALF_HALF_REGEX);
+
+                        if (halfMatch) {
+                            const flavorA = limpaTexto(halfMatch[1].trim()).substring(0, 28).padEnd(28, ' ');
+                            const flavorB = limpaTexto(halfMatch[2].trim()).substring(0, 28).padEnd(28, ' ');
+                            printer.style('b').text(`${qty}x 1/2 ${flavorA}`);
+                            printer.text(`    1/2 ${flavorB} R$ ${price}`).style('normal');
+                        } else {
+                            const name = limpaTexto(item.name || 'Produto').substring(0, 32).padEnd(32, ' ');
+                            printer.style('b').text(`${qty}x ${name} R$ ${price}`).style('normal');
+                        }
+
                         if (item.details) {
                             printer.text(`   -> ${limpaTexto(item.details)}`);
                         }
@@ -317,10 +354,12 @@ function executePrint(order, safeOrderId) {
                     }
 
                     // CUT & CLOSE
-                    printer.align('ct').style('normal');
-                    printer.text('------------------------------------------------');
-                    printer.text(`Pedido via iFood  ${orderDate}`);
+                    printer.align('ct').style('normal').font('b');
+                    printer.text('------------------------------------------------------------');
+                    printer.text(`Via ${sourceLabel}`);
+                    printer.text(`${orderDate}`);
                     printer.feed(1).text('Obrigado pela preferencia!');
+                    printer.font('a');
                     printer.feed(4).cut().close(() => { resolve(); });
                         
                 } catch (printErr) {
@@ -335,6 +374,77 @@ function executePrint(order, safeOrderId) {
 
 app.get('/logs', (req, res) => res.json(logs));
 app.get('/pedidos', (req, res) => res.json(pedidos));
+
+// --- CONFIG ENDPOINT: Set server URL/secret without restarting ---
+app.post('/config', (req, res) => {
+    const { serverUrl, serverSecret } = req.body || {};
+    if (serverUrl !== undefined) SERVER_URL = serverUrl.trim();
+    if (serverSecret !== undefined) SERVER_SECRET = serverSecret.trim();
+    saveConfig({ serverUrl: SERVER_URL, serverSecret: SERVER_SECRET });
+    if (SERVER_URL && SERVER_SECRET && !pollingInterval) {
+        pollingInterval = setInterval(pollPrintQueue, 5000);
+        pollPrintQueue();
+        addLog(`[POLL] Polling iniciado via /config: ${SERVER_URL}`);
+    }
+    res.json({ success: true, polling: !!(SERVER_URL && SERVER_SECRET) });
+});
+
+// --- HTTP HELPERS (no extra deps — uses Node built-in http/https) ---
+function httpGet(url, headers = {}) {
+    return new Promise((resolve, reject) => {
+        const lib = url.startsWith('https') ? https : http;
+        lib.get(url, { headers }, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try { resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, data: JSON.parse(data) }); }
+                catch { resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, data: {} }); }
+            });
+        }).on('error', reject);
+    });
+}
+
+function httpPost(url, body, headers = {}) {
+    return new Promise((resolve, reject) => {
+        const lib = url.startsWith('https') ? https : http;
+        const payload = JSON.stringify(body);
+        const urlObj = new URL(url);
+        const options = {
+            hostname: urlObj.hostname,
+            port: urlObj.port || (url.startsWith('https') ? 443 : 80),
+            path: urlObj.pathname + urlObj.search,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), ...headers }
+        };
+        const req = lib.request(options, (res) => {
+            let d = '';
+            res.on('data', c => d += c);
+            res.on('end', () => resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode }));
+        });
+        req.on('error', reject);
+        req.write(payload);
+        req.end();
+    });
+}
+
+// --- SERVER POLLING: Pull unprinted orders from the cloud server ---
+async function pollPrintQueue() {
+    if (!SERVER_URL || !SERVER_SECRET || !PRINTER_IP) return;
+    try {
+        const result = await httpGet(`${SERVER_URL}/api/orders/print-queue`, { 'x-printer-secret': SERVER_SECRET });
+        if (!result.ok || !Array.isArray(result.data.orders)) return;
+        for (const order of result.data.orders) {
+            if (PRINTED_IDS.has(order.id)) continue;
+            PRINTED_IDS.add(order.id);
+            const safeId = limpaTextoRaw(order.shortCode || String(order.id || 'NONE').slice(-6).toUpperCase());
+            printQueue.push({ order, safeOrderId: safeId, res: null, fromPoll: true });
+            addLog(`[POLL] Pedido #${safeId} recebido do servidor.`);
+        }
+        if (printQueue.length > 0) processQueue();
+    } catch (e) {
+        addLog(`[POLL] Falha na conexao com servidor: ${e.message}`, true);
+    }
+}
 
 // --- STARTUP & CONNECTION CHECK SEQUENCE ---
 
@@ -375,7 +485,7 @@ function promptForIp() {
         
         testPrinterConnection((success, errorMsg) => {
             if (success) {
-                saveConfig(PRINTER_IP);
+                saveConfig({ printerIp: PRINTER_IP });
                 safeLog("✅ Impressora conectada e IP salvo com sucesso!");
                 if (!serverStarted) startServer();
                 else printReadyScreen();
@@ -420,6 +530,13 @@ function startServer() {
     app.listen(PORT, '0.0.0.0', () => {
         serverStarted = true;
         printReadyScreen();
+        if (SERVER_URL && SERVER_SECRET) {
+            addLog(`[POLL] Polling ativo: ${SERVER_URL}`);
+            pollPrintQueue();
+            pollingInterval = setInterval(pollPrintQueue, 5000);
+        } else {
+            addLog('[POLL] Polling desativado. Edite printer-config.json (serverUrl + serverSecret) ou chame POST /config para ativar.');
+        }
     }).on('error', (err) => {
         if (err.code === 'EADDRINUSE') {
             safeLog(`[ERRO CRITICO] A porta ${PORT} ja esta em uso. O proxy ja esta aberto em outra janela?`);
@@ -434,7 +551,10 @@ function startupSequence() {
     console.clear();
     console.log("Iniciando Proxy Lar Pizza...\n");
     
-    PRINTER_IP = loadConfig();
+    const cfg = loadConfig();
+    PRINTER_IP = cfg.printerIp;
+    SERVER_URL = cfg.serverUrl;
+    SERVER_SECRET = cfg.serverSecret;
     
     if (!PRINTER_IP) {
         console.log("Nenhum IP de impressora configurado anteriormente.");
