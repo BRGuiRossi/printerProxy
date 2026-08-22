@@ -208,14 +208,37 @@ function executePrint(order, safeOrderId) {
                         return String(str).normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^\x20-\x7E\r\n]/g, '');
                     };
 
-                    // Format address — iFood can send either a plain string or an object
-                    const formatAddress = (addr) => {
-                        if (!addr) return 'Nao informado';
-                        if (typeof addr === 'string') return limpaTexto(addr);
-                        return limpaTexto(
-                            [addr.street, addr.number, addr.complement, addr.neighborhood, addr.city, addr.state]
-                            .filter(Boolean).join(', ')
-                        );
+                    // Address parts — prefers the flat delivery* fields (present on every order
+                    // source), falling back to an object-shaped or legacy pre-joined deliveryAddress.
+                    // Number + complement are always kept in a single printer.text() call so the
+                    // printer's own line-wrap can never silently split them onto two lines.
+                    const buildAddressParts = (order) => {
+                        let street = order.deliveryStreetName || '';
+                        let number = order.deliveryStreetNumber || '';
+                        let complement = order.deliveryComplement || '';
+                        let neighborhood = order.deliveryNeighborhood || '';
+                        let city = order.deliveryCity || '';
+
+                        const addr = order.deliveryAddress;
+                        if (!street && addr && typeof addr === 'object') {
+                            street = addr.street || '';
+                            number = number || addr.number || '';
+                            complement = complement || addr.complement || '';
+                            neighborhood = neighborhood || addr.neighborhood || '';
+                            city = city || addr.city || '';
+                        }
+
+                        if (!street && !number && typeof addr === 'string' && addr) {
+                            // Legacy pre-joined string, no structured data available — best effort
+                            return { legacy: limpaTexto(addr) };
+                        }
+
+                        const numComp = [number ? `No ${number}` : '', complement].filter(Boolean).join(' - ');
+                        return {
+                            street: street ? limpaTexto(street) : '',
+                            numComp: numComp ? limpaTexto(numComp) : '',
+                            locality: [neighborhood, city].filter(Boolean).join(', '),
+                        };
                     };
 
                     const isPickup = order.shippingMethod === 'pickup' || order.deliveryType === 'pickup';
@@ -274,8 +297,16 @@ function executePrint(order, safeOrderId) {
                     // ==========================================
                     if (!isPickup) {
                         printer.style('b').text('ENDERECO DE ENTREGA:').style('normal');
-                        printer.text(formatAddress(order.deliveryAddress));
-                        
+                        const addressParts = buildAddressParts(order);
+                        if (addressParts.legacy) {
+                            printer.text(addressParts.legacy);
+                        } else {
+                            if (addressParts.street) printer.text(addressParts.street);
+                            if (addressParts.numComp) printer.style('b').text(addressParts.numComp).style('normal');
+                            if (addressParts.locality) printer.text(limpaTexto(addressParts.locality));
+                            if (!addressParts.street && !addressParts.numComp && !addressParts.locality) printer.text('Nao informado');
+                        }
+
                         if (order.deliveryObservations) {
                             printer.feed(1).style('b').text('OBSERVACOES P/ ENTREGADOR:');
                             printer.style('normal').text(limpaTexto(order.deliveryObservations));
